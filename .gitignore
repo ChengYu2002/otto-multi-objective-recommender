@@ -1,0 +1,21 @@
+# 数据(太大,不进 git)
+data/
+*.parquet
+*.jsonl
+
+# 结果(大文件不进,小的消融表可手动 add)
+results/*.parquet
+submission*.csv
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# 环境 / 系统
+.DS_Store
+kaggle.json
+
+# 个人规划 / 面试准备 / 过程笔记
+interview_note/
