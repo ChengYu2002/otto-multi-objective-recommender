@@ -39,9 +39,9 @@ if __name__ == "__main__":
         val_input = val_input.join(keep, on="session", how="semi")
         val_labels = val_labels.join(keep, on="session", how="semi")
 
-    # 建 / 载 click co-vis 矩阵
+    # 建 / 载 click co-vis 矩阵(用防泄漏语料;--build 时连语料一起重建)
     if rebuild or not (COVIS_DIR / "click.parquet").exists():
-        build_covis("click", max_chunks=5 if sample else None)   # sample 只用 1/6 训练数据
+        build_covis("click", max_chunks=5 if sample else None, rebuild_corpus=rebuild)
     covis = load_covis("click")
     popular = build_popularity()
 

@@ -24,8 +24,11 @@ import polars as pl
 ROOT = Path(__file__).resolve().parents[2]          # src/recall/covis.py -> OTTO/
 DATA = ROOT / "data"
 TRAIN_PARQUET = DATA / "parquet" / "train" / "*.parquet"
+VAL_INPUT = DATA / "parquet" / "val" / "input.parquet"
 COVIS_DIR = DATA / "parquet" / "covis"
+CORPUS_PARQUET = DATA / "parquet" / "covis_corpus.parquet"
 DAY_MS = 86_400_000
+VAL_DAYS = 7                                        # 必须与 make_validation_set 的 val_days 一致
 
 # 三张矩阵的差异全在:时间窗口 / 事件过滤 / 邻居数 / 加权(见 _weight_expr)
 # Step 1 只启用 click;buy_weighted 和 buy2buy 留到 Step 2。
@@ -43,17 +46,45 @@ def _weight_expr(kind: str, tmin: int, tmax: int) -> pl.Expr:
     raise NotImplementedError(f"Step 2 再实现 {kind} 的加权")
 
 
+def build_corpus(force: bool = False) -> Path:
+    """
+    建 co-vis 语料 —— 防验证泄漏的关键一步。
+    ----------------------------------------------------------------
+    语料 = 历史(ts < 窗口边界)⊕ val_input(验证 session 的可见前半段),
+    刻意**排除所有验证"未来"事件**(即 val_labels 那部分)。
+
+    为什么:若直接读原始 train,某个验证 session 的答案(cutoff 之后的事件)
+    会和它的输入一起被数进共现矩阵,等于"用答案预测答案"——target leakage。
+    只保留每个 session 在预测时刻能看到的事件,泄漏就不存在了。
+    """
+    if CORPUS_PARQUET.exists() and not force:
+        return CORPUS_PARQUET
+    lf = pl.scan_parquet(TRAIN_PARQUET)
+    max_ts = lf.select(pl.col("ts").max()).collect().item()
+    boundary = max_ts - VAL_DAYS * DAY_MS
+    history = lf.filter(pl.col("ts") < boundary)        # 窗口前的全部历史(无未来)
+    visible = pl.scan_parquet(VAL_INPUT)                # 验证 session 的可见事件(已剔除未来)
+    CORPUS_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    pl.concat([history, visible]).sink_parquet(CORPUS_PARQUET)   # 流式写,省内存
+    print(f"[corpus] ✅ 防泄漏语料已建(历史 + val_input,排除未来)"
+          f"-> {CORPUS_PARQUET.name}", flush=True)
+    return CORPUS_PARQUET
+
+
 def build_covis(kind: str = "click", n_chunks: int = 30,
-                max_chunks: int | None = None, session_cap: int = 30):
+                max_chunks: int | None = None, session_cap: int = 30,
+                rebuild_corpus: bool = False):
     """建一张 co-vis 矩阵并落盘为 data/parquet/covis/{kind}.parquet。
 
-    n_chunks   : 按 session 分成多少块(越多越省内存、越慢)
-    max_chunks : 只处理前几块(采样,快速验证用);None = 全部
-    session_cap: 每个 session 只保留最近多少个事件
+    n_chunks       : 按 session 分成多少块(越多越省内存、越慢)
+    max_chunks     : 只处理前几块(采样,快速验证用);None = 全部
+    session_cap    : 每个 session 只保留最近多少个事件
+    rebuild_corpus : 强制重建防泄漏语料(改了 val 切分后需要)
     """
     cfg = COVIS_CONFIG[kind]
     t0 = time.time()
-    lf = pl.scan_parquet(TRAIN_PARQUET)
+    build_corpus(force=rebuild_corpus)              # ← 用防泄漏语料,不是原始 train
+    lf = pl.scan_parquet(CORPUS_PARQUET)
     if cfg["types"] is not None:                    # buy2buy 只看加购/下单
         lf = lf.filter(pl.col("type").is_in(cfg["types"]))
     tmin, tmax = lf.select(pl.col("ts").min().alias("mn"),
