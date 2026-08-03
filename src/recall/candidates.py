@@ -23,14 +23,23 @@ TIER_POP = 2000
 
 def get_seeds(val_input: pl.DataFrame, max_seeds: int = 30) -> pl.DataFrame:
     """每个 session 的最近去重商品 + 权重(近期衰减 × 最近一次的类型权重)。"""
+    # 同一个商品重复出现时，只保留它最近一次的信息
+    # 按 session+aid 聚合,取最近一次 ts 和 type → 按 session+ts 排序 → 取前 max_seeds
     g = (val_input.group_by(["session", "aid"])
          .agg(last_ts=pl.col("ts").max(),
               last_type=pl.col("type").sort_by("ts").last()))
+    
+    # 在去重后的商品中，只选当前 session 最近的几个商品作为种子。
+    # 按 session 排序,最近的种子排前面 → 取前 max_seeds 个
     g = (g.sort(["session", "last_ts"], descending=[False, True])
           .with_columns(rank=pl.int_range(pl.len()).over("session"))
           .filter(pl.col("rank") < max_seeds))
+    
+    # 计算种子权重 = 近期衰减 × 类型权重
     type_w = pl.col("last_type").replace_strict(TYPE_W, return_dtype=pl.Float64)
+    # 近期衰减:最新种子权重 1,往前每位 ×0.9
     g = g.with_columns(seed_wgt=pl.lit(DECAY).pow(pl.col("rank")) * type_w)
+
     return g.select("session", "aid", "seed_wgt")
 
 

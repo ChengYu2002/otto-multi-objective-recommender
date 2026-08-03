@@ -40,9 +40,32 @@ COVIS_CONFIG = {
 
 
 def _weight_expr(kind: str, tmin: int, tmax: int) -> pl.Expr:
-    """每个共现对的权重。click:近期加权(邻居事件越新权重越高,1~4)。"""
+    """返回“每一行共现商品对如何计算权重”的 Polars 表达式。
+
+    注意返回值是 pl.Expr（列计算规则），不是已经算好的单个数字。调用方会在：
+        pairs.with_columns(w=_weight_expr(...))
+    中把这条规则应用到 pairs 的每一行，生成 w 列。
+
+    self join 后一行商品对的关键列是：
+        aid, ts          左表商品 x 及其事件时间
+        aid_y, ts_y      右表邻居 y 及其事件时间（suffix="_y"）
+    因而对于有向关系 x → y，ts_y 表示“邻居 y 这次事件发生的时间”。
+
+    click 的权重把 ts_y 在全局训练时间范围 [tmin, tmax] 中的位置线性映射到
+    [1, 4]：最早事件约为 1，时间中点为 2.5，最新事件约为 4。这样最近发生的
+    共现关系会比很早以前的共现关系贡献更多票。
+
+    这里衡量的是“这条关系在整个训练时间轴上有多新”；两次事件彼此相隔多久，
+    由 build_covis() 中 abs(ts - ts_y) <= window 的过滤条件另外控制。
+    """
     if kind == "click":
+        # 第一步：(ts_y - tmin) / (tmax - tmin) 把时间归一化到 [0, 1]。
+        # 第二步：乘 3 再加 1，把 [0, 1] 转换到 [1, 4]。
+        # 例：ts_y 位于训练时间轴正中间 → 1 + 3 × 0.5 = 2.5。
         return 1 + 3 * (pl.col("ts_y") - tmin) / (tmax - tmin)
+
+    # 当前 Step 1 只实现 click；若误调用 buy_weighted/buy2buy，就明确报错，
+    # 避免在没有正确权重公式时静默生成错误矩阵。
     raise NotImplementedError(f"Step 2 再实现 {kind} 的加权")
 
 
@@ -101,10 +124,29 @@ def build_covis(kind: str = "click", n_chunks: int = 30,
         if df.is_empty():
             continue
 
-        # ① 截断:每 session 只留最近 session_cap 个事件
+        # ① 截断：每个 session 最多只保留最近 session_cap 个事件。
+        #
+        # 先按 session 分组、ts 从早到晚排列。随后添加两个临时辅助列：
+        #   _n = 该行所属 session 的事件总数。
+        #        pl.len().over("session") 是窗口计算：按 session 算长度，
+        #        但不把多行压成一行，所以同一 session 的每行都会重复保存 _n。
+        #   _i = 该事件在 session 内按时间排列后的编号，从 0 开始。
+        #        pl.int_range(pl.len()).over("session") 会为每个 session 分别生成
+        #        0, 1, 2, ...；因为前面已按 ts 升序，_i 越大代表事件越新。
+        #
+        # 例如某 session 有 5 条事件、session_cap=3：
+        #   _n = [5, 5, 5, 5, 5]
+        #   _i = [0, 1, 2, 3, 4]
+        #   过滤条件 _i >= _n-session_cap，即 _i >= 2，只保留编号 2/3/4，
+        #   也就是最近 3 条。若事件总数小于 session_cap，右侧会是负数，
+        #   所有 _i 都满足条件，因此原事件全部保留。
+        #
+        # 截断后 _n、_i 已经完成使命，用 drop 删除，避免污染后面的商品对表。
         df = (df.sort(["session", "ts"])
-                .with_columns(_n=pl.len().over("session"),
-                              _i=pl.int_range(pl.len()).over("session"))
+                .with_columns(
+                    _n=pl.len().over("session"),
+                    _i=pl.int_range(pl.len()).over("session"),
+                )
                 .filter(pl.col("_i") >= pl.col("_n") - session_cap)
                 .drop(["_n", "_i"]))
 
@@ -113,18 +155,46 @@ def build_covis(kind: str = "click", n_chunks: int = 30,
                    .filter((pl.col("aid") != pl.col("aid_y")) &
                            ((pl.col("ts") - pl.col("ts_y")).abs() <= cfg["window"])))
 
-        # ③ 加权 + chunk 内先聚合(把体积从"对"降到"唯一对")
-        agg = (pairs.with_columns(w=_weight_expr(kind, tmin, tmax))
-                    .group_by(["aid", "aid_y"]).agg(pl.col("w").sum().alias("wgt")))
+        # ③ 加权 + chunk 内先聚合：把大量重复的“商品对记录”压成
+        #    “每个有向商品对一行”。注意 A→B 和 B→A 是两个不同的分组。
+        #
+        # pairs 中，同一个 A→B 可能因为出现在多个历史 session 而有很多行：
+        #   session 1: A→B, w=1.5
+        #   session 2: A→B, w=3.5
+        #   session 3: A→B, w=3.1
+        #
+        # with_columns(w=...)：把 _weight_expr 返回的 Polars 表达式应用到
+        # pairs 的每一行，生成该次共现贡献的临时权重列 w。
+        # group_by(["aid", "aid_y"])：把起点和邻居都相同的有向对归为一组。
+        # agg(sum(w).alias("wgt"))：把组内所有票相加，并将累计结果命名为 wgt。
+        # 上面的三行 A→B 最终压成一行：A→B, wgt=1.5+3.5+3.1=8.1。
+        #
+        # 这里只聚合当前 chunk；不同 chunk 中的同一 A→B 会在步骤④再次求和。
+        # 两级聚合能让原始 pairs 尽快缩小，避免所有共现记录同时占用内存。
+        agg = (
+            pairs.with_columns(w=_weight_expr(kind, tmin, tmax))
+                 .group_by(["aid", "aid_y"])
+                 .agg(pl.col("w").sum().alias("wgt"))
+        )
+
+        # 将当前 chunk 的唯一商品对写成临时 Parquet，使内存可以继续处理下一块。
+        # {c:03d} 表示把编号补成 3 位：0→000、1→001、12→012。
         agg.write_parquet(tmp / f"part_{c:03d}.parquet")
+
+        # agg.height 是当前 chunk 聚合后的“不同 aid→aid_y 数量”，
+        # 不是原始事件数或 session 数。c+1 用于把程序内部的 0 起编号显示成
+        # 人类习惯的 1 起进度；elapsed 是程序启动后的累计秒数。
+        # flush=True 强制立即输出，长任务运行时能实时看到进度，而不等缓冲区刷新。
         print(f"[covis:{kind}] chunk {c + 1}/{n_use} | 唯一对 {agg.height:,} "
               f"| {time.time() - t0:.0f}s", flush=True)
 
     # ④ 合并所有块 → 再求和 → 每个 aid_x 只留 top_n 邻居
     COVIS_DIR.mkdir(parents=True, exist_ok=True)
-    final = (pl.scan_parquet(tmp / "*.parquet")
-               .group_by(["aid", "aid_y"]).agg(pl.col("wgt").sum())
+    final = (pl.scan_parquet(tmp / "*.parquet")         # 流式读所有 chunk
+               .group_by(["aid", "aid_y"]).agg(pl.col("wgt").sum()) # 跨 chunk 聚合, 根据 aid→aid_y 求和
                .collect(engine="streaming"))       # 流式聚合,内存不随分块数膨胀
+    
+    # ⑤ 排序 + 截 top_n
     final = (final.sort(["aid", "wgt"], descending=[False, True])
                   .with_columns(_r=pl.int_range(pl.len()).over("aid"))
                   .filter(pl.col("_r") < cfg["top_n"])

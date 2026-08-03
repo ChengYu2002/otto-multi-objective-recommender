@@ -26,8 +26,8 @@ def build_popularity(days: int = 7, k: int = 20, val_days: int = 7) -> list[int]
     boundary = max_ts - val_days * DAY_MS         # 验证窗口起点 = 预测时刻
     lo = boundary - days * DAY_MS                 # 只看预测时刻之前的 days 天
     top = (lf.filter((pl.col("ts") >= lo) & (pl.col("ts") < boundary))
-             .group_by("aid").agg(pl.len().alias("cnt"))
-             .sort("cnt", descending=True)
+             .group_by("aid").agg(pl.len().alias("cnt")) # 按 aid 计数
+             .sort("cnt", descending=True) # 按出现次数降序
              .head(k)
              .collect())
     return top["aid"].to_list()
