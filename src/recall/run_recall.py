@@ -39,13 +39,19 @@ if __name__ == "__main__":
         val_input = val_input.join(keep, on="session", how="semi")
         val_labels = val_labels.join(keep, on="session", how="semi")
 
-    # 建 / 载 click co-vis 矩阵(用防泄漏语料;--build 时连语料一起重建)
-    if rebuild or not (COVIS_DIR / "click.parquet").exists():
-        build_covis("click", max_chunks=5 if sample else None, rebuild_corpus=rebuild)
-    covis = load_covis("click")
+    KINDS = ["click", "buy_weighted", "buy2buy"]
+
+    for kind in KINDS:
+        # 建 / 载 click co-vis 矩阵(用防泄漏语料;--build 时连语料一起重建)
+        if rebuild or not (COVIS_DIR / f"{kind}.parquet").exists():
+            build_covis(kind, max_chunks=5 if sample else None, rebuild_corpus=rebuild)
+    
+    # 载入三张 co-vis 矩阵
+    matrices = {kind: load_covis(kind) for kind in KINDS}
+
     popular = build_popularity()
 
     scope = "sample(10万 val · 1/6 训练)" if sample else "全量"
     print(f"\n=== 召回评估 · {scope} ===")
     _fmt("recent(自身臂)", evaluate(baseline_recent(val_input), val_labels))
-    _fmt("self+click-covis", evaluate(generate_predictions(val_input, covis, popular), val_labels))
+    _fmt("multi-covis", evaluate(generate_predictions(val_input, matrices, popular), val_labels))

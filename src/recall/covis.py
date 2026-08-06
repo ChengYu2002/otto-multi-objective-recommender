@@ -34,8 +34,9 @@ VAL_DAYS = 7                                        # 必须与 make_validation_
 # Step 1 只启用 click;buy_weighted 和 buy2buy 留到 Step 2。
 COVIS_CONFIG = {
     "click": {"window": 60 * 60 * 1000, "types": None, "top_n": 20},   # 1 小时,不过滤
-    # "buy_weighted": {"window": 60 * 60 * 1000, "types": None,   "top_n": 20},
-    # "buy2buy":      {"window": 14 * DAY_MS,     "types": [1, 2], "top_n": 20},
+    "buy_weighted": {"window": 60 * 60 * 1000, "types": None,   "top_n": 20}, # 1 小时,不过滤
+    "buy2buy":      {"window": 14 * DAY_MS,     "types": [1, 2], "top_n": 20}, 
+    # 14 天, 只看加购/下单: type1,2; 购买跨度长(可能隔好几天),所以窗口从 1 小时放宽到 14 天
 }
 
 
@@ -64,9 +65,15 @@ def _weight_expr(kind: str, tmin: int, tmax: int) -> pl.Expr:
         # 例：ts_y 位于训练时间轴正中间 → 1 + 3 × 0.5 = 2.5。
         return 1 + 3 * (pl.col("ts_y") - tmin) / (tmax - tmin)
 
-    # 当前 Step 1 只实现 click；若误调用 buy_weighted/buy2buy，就明确报错，
-    # 避免在没有正确权重公式时静默生成错误矩阵。
-    raise NotImplementedError(f"Step 2 再实现 {kind} 的加权")
+    if kind == "buy_weighted":
+        # 按“邻居事件的类型”加权:加购/下单比点击值钱(不是按时间)
+        return pl.col("type_y").replace_strict({0: 1.0, 1: 6.0, 2: 3.0}, 
+                                            return_dtype=pl.Float64)
+    if kind == "buy2buy":
+        return pl.lit(1.0)     # 纯计数;“买→买”的共现, 不加权
+    
+                                            
+    raise NotImplementedError(f"未知 co-vis 矩阵种类: {kind}")
 
 
 def build_corpus(force: bool = False) -> Path:
