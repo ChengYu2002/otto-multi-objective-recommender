@@ -69,7 +69,7 @@ def _predict_one_type(seeds: pl.DataFrame, self_c: pl.DataFrame,
     covis_votes = (pl.concat([_votes(seeds, matrices[n]) for n in names])
                      .group_by(["session", "aid"]).agg(pl.col("score").sum()))
 
-    # ② co-vis 臂:按总票数排,ord 从 TIER_COVIS(1000)起,排在自身臂之后
+    # ② co-vis 臂:按总票数排,ord 从 TIER_COVIS(1000)起,排在自身臂之后 （这就是“硬分层”）
     covis_c = (covis_votes.sort(["session", "score"], descending=[False, True])
                           .with_columns(ord=TIER_COVIS + pl.int_range(pl.len()).over("session"))
                           .select("session", "aid", "ord"))
@@ -95,10 +95,12 @@ def generate_predictions(val_input: pl.DataFrame, matrices: dict,
     self_c = (seeds.sort(["session", "seed_wgt"], descending=[False, True])
                    .with_columns(ord=pl.int_range(pl.len()).over("session"))
                    .select("session", "aid", "ord"))
+    
     pop_df = (pl.DataFrame({"aid": pl.Series(popular, dtype=pl.Int32)})
                 .with_row_index("pr")
                 .with_columns(ord=TIER_POP + pl.col("pr").cast(pl.Int64))
                 .select("aid", "ord"))
+     
     pop_long = seeds.select("session").unique().join(pop_df, how="cross")
 
     # 按目标各跑一遍,只有 co-vis 那一路换矩阵

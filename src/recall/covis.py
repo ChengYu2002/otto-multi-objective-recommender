@@ -125,6 +125,7 @@ def build_covis(kind: str = "click", n_chunks: int = 30,
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True)
 
+    # 按 session 分块,每块独立处理,避免全量两两成对爆内存
     n_use = max_chunks or n_chunks
     for c in range(n_use):
         df = lf.filter(pl.col("session") % n_chunks == c).collect()
