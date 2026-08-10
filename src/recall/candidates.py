@@ -141,3 +141,24 @@ def generate_predictions(val_input: pl.DataFrame, matrices: dict,
              .with_columns(type=pl.lit(t, dtype=pl.Int8))
            for t, names in TYPE_MATRIX.items()]
     return pl.concat(out).select("session", "type", "prediction")
+
+
+def generate_predictions_chunked(val_input: pl.DataFrame, matrices: dict,
+                                 popular: list[int], k: int = 20,
+                                 max_seeds: int = 30, n_chunks: int = 1) -> pl.DataFrame:
+    """按 session 分 n_chunks 批,各调 generate_predictions 再拼 → 控内存/提速。
+
+    session 之间互相独立(一个 session 的候选只看它自己的历史),所以按
+    `session % n_chunks` 切开、各算各的、最后拼起来,结果和不分块**完全一样**
+    —— 又一个 embarrassingly parallel。核心逻辑一行不改,只包一层批循环。
+    n_chunks<=1 时直接走原函数。
+    """
+    if n_chunks <= 1:
+        return generate_predictions(val_input, matrices, popular, k, max_seeds)
+    parts = []
+    for b in range(n_chunks):
+        vb = val_input.filter(pl.col("session") % n_chunks == b)
+        if vb.height == 0:
+            continue
+        parts.append(generate_predictions(vb, matrices, popular, k, max_seeds))
+    return pl.concat(parts)

@@ -229,6 +229,49 @@ def evaluate(preds: pl.DataFrame, labels: pl.DataFrame) -> dict:
     return res
 
 
+def evaluate_at_ks(preds: pl.DataFrame, labels: pl.DataFrame,
+                   ks=(20, 50, 100)) -> dict:
+    """多个 K 的加权 Recall@K → {K: {clicks, carts, orders, weighted}}。
+
+    recall@100 = Phase 3 精排的天花板:GBDT 只能在候选集里重排,
+    没进 top-100 的正样本它也捞不回来。@20 是 LB 口径的正式分。
+    """
+    L = labels.with_columns(pl.col("ground_truth").cast(pl.List(pl.Int64)))
+    P = preds.with_columns(pl.col("prediction").cast(pl.List(pl.Int64)))
+    df = (L.join(P, on=["session", "type"], how="left")
+           .with_columns(
+               pl.when(pl.col("prediction").is_null())
+                 .then(pl.lit([], dtype=pl.List(pl.Int64)))
+                 .otherwise(pl.col("prediction")).alias("prediction")))
+
+    out: dict = {}
+    for k_ in ks:
+        d = (df.with_columns(pl.col("prediction").list.head(k_).alias("predk"))
+               .with_columns(
+                   hits=pl.col("predk").list.set_intersection(pl.col("ground_truth")).list.len(),
+                   denom=pl.min_horizontal(pl.lit(k_), pl.col("ground_truth").list.len()),
+               ))
+        agg = d.group_by("type").agg(num=pl.col("hits").sum(), den=pl.col("denom").sum())
+        res: dict[str, float] = {}
+        for row in agg.iter_rows(named=True):
+            res[INV_TYPE[row["type"]]] = row["num"] / row["den"] if row["den"] else 0.0
+        res["weighted"] = sum(WEIGHTS[t] * res.get(t, 0.0) for t in WEIGHTS)
+        out[k_] = res
+    return out
+
+
+def popular_share(preds: pl.DataFrame, popular: list[int], k: int = 20) -> dict:
+    """top-k 里有多少比例落在热门表 → {clicks, carts, orders}。
+    偏高 = 召回不够力、靠热门凑数。注:是上界(真候选也可能恰好是热门)。
+    """
+    pop = pl.Series("p", popular, dtype=pl.Int64)
+    d = (preds.with_columns(pl.col("prediction").cast(pl.List(pl.Int64)).list.head(k))
+              .explode("prediction")
+              .with_columns(is_pop=pl.col("prediction").is_in(pop))
+              .group_by("type").agg(share=pl.col("is_pop").mean()))
+    return {INV_TYPE[r["type"]]: r["share"] for r in d.iter_rows(named=True)}
+
+
 # ---------------------------------------------------------------------------
 # 自测入口
 # ---------------------------------------------------------------------------
