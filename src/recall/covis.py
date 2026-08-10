@@ -33,9 +33,9 @@ VAL_DAYS = 7                                        # 必须与 make_validation_
 # 三张矩阵的差异全在:时间窗口 / 事件过滤 / 邻居数 / 加权(见 _weight_expr)
 # Step 1 只启用 click;buy_weighted 和 buy2buy 留到 Step 2。
 COVIS_CONFIG = {
-    "click": {"window": 60 * 60 * 1000, "types": None, "top_n": 20},   # 1 小时,不过滤
-    "buy_weighted": {"window": 60 * 60 * 1000, "types": None,   "top_n": 20}, # 1 小时,不过滤
-    "buy2buy":      {"window": 14 * DAY_MS,     "types": [1, 2], "top_n": 20}, 
+    "click": {"window": 60 * 60 * 1000, "types": None, "top_n": 50},   # 1 小时,不过滤
+    "buy_weighted": {"window": 60 * 60 * 1000, "types": None,   "top_n": 50}, # 1 小时,不过滤
+    "buy2buy":      {"window": 14 * DAY_MS,     "types": [1, 2], "top_n": 50}, 
     # 14 天, 只看加购/下单: type1,2; 购买跨度长(可能隔好几天),所以窗口从 1 小时放宽到 14 天
 }
 

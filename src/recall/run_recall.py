@@ -35,10 +35,11 @@ if __name__ == "__main__":
     # 正确答案
     val_labels = pl.read_parquet(VAL_DIR / "labels.parquet")
 
-    if sample:                          
-        # 取前 10 万 session 切片,不覆盖 val 文件
-        keep = val_input.select("session").unique().sort("session").head(100_000)
-        # 只保留切片(keep)的 session,防止泄漏
+    if sample:
+        # 随机抽 10 万 session(不覆盖 val 文件)。用随机而非按 id 取前 N:
+        # 按 id 取前 N 是偏样本(长 session 扎堆,baseline 只有 0.33);随机采样
+        # 才和全量同分布(baseline ~0.41),小旋钮实验的相对排序才可信。
+        keep = val_input.select("session").unique().sample(100_000, seed=42)
         val_input = val_input.join(keep, on="session", how="semi")
         val_labels = val_labels.join(keep, on="session", how="semi")
 

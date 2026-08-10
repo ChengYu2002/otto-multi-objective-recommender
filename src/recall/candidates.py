@@ -2,19 +2,29 @@
 Phase 2 · 召回 · 候选生成(阶段②+③)
 ===================================
 把"每个 session 的可见历史 + 三张 co-vis 矩阵 + 热门表"变成
-preds[session, type, prediction]。三个目标各用不同的矩阵组合(分目标融合)。
+preds[session, type, prediction]。三个目标各用不同的矩阵组合(分目标融合),
+且融合策略可按目标切换:硬分层(自身优先)或软融合(分数混排)。
 
-三臂(分层):
-  自身臂  —— 种子(最近去重商品)本身,ord 从 0 起 → 复访候选永远排最前。
+三臂:
+  自身臂  —— 种子(最近去重商品)本身,分数 = seed_wgt(近期×类型)。
   co-vis 臂 —— 每个种子给邻居加权投票;一个目标用多张矩阵时,票相加合成一路。
   热门兜底 —— ord 最大,只填空位。
+
+融合(见 TYPE_BLEND):
+  硬分层  —— 自身臂永远压 co-vis(clicks 复访主导,适用)。
+  软融合  —— 两臂分数归一化后加权求和,强 co-vis 新品能盖过弱自身(carts/orders)。
 """
 import polars as pl
 
 # 类型权重:加购/下单比点击值钱(Chris Deotte 常用 1/6/3)
 TYPE_W = {0: 1.0, 1: 6.0, 2: 3.0}
 DECAY = 0.9                 # 种子近期衰减:最新种子权重 1,往前每位 ×0.9
-# 分层偏置:自身臂 ord 从 0 起、co-vis 从 1000 起、热门从 2000 起 →
+
+# 融合策略:False=硬分层(自身永远优先),True=软融合(按分数混排)
+TYPE_BLEND = {0: False, 1: False, 2: False}  # 硬分层:软融合实验证伪(见 experiments.md)
+W_SELF, W_COVIS = 1.0, 1.0                   # 软融合两臂权重(要扫的 α)
+
+# 硬分层偏置:自身臂 ord 从 0 起、co-vis 从 1000 起、热门从 2000 起 →
 # 保证复访候选永远排在纯 co-vis 前,co-vis 只填自身臂用剩的空位。
 TIER_COVIS = 1000
 TIER_POP = 2000
@@ -61,22 +71,50 @@ def _votes(seeds: pl.DataFrame, covis: pl.DataFrame) -> pl.DataFrame:
                  .rename({"aid_y": "aid"}))
 
 
-def _predict_one_type(seeds: pl.DataFrame, self_c: pl.DataFrame,
-                      pop_long: pl.DataFrame, matrices: dict,
-                      names: list[str], k: int) -> pl.DataFrame:
-    """一个目标:合并 names 里所有矩阵的票 + 自身 + 兜底 → [session, prediction]。"""
-    # ① 多张矩阵的票"相加"合成一路 co-vis(被多路共同看好的候选浮上来)
-    covis_votes = (pl.concat([_votes(seeds, matrices[n]) for n in names])
-                     .group_by(["session", "aid"]).agg(pl.col("score").sum()))
-
-    # ② co-vis 臂:按总票数排,ord 从 TIER_COVIS(1000)起,排在自身臂之后 （这就是“硬分层”）
+def _hard_rank(self_scored: pl.DataFrame, covis_votes: pl.DataFrame) -> pl.DataFrame:
+    """硬分层:自身 tier0 + co-vis tier1 → [session, aid, ord]。臂决定优先级。"""
+    self_c = (self_scored.sort(["session", "score"], descending=[False, True])
+                         .with_columns(ord=pl.int_range(pl.len()).over("session"))
+                         .select("session", "aid", "ord"))
     covis_c = (covis_votes.sort(["session", "score"], descending=[False, True])
                           .with_columns(ord=TIER_COVIS + pl.int_range(pl.len()).over("session"))
                           .select("session", "aid", "ord"))
+    return pl.concat([self_c, covis_c])
 
-    # ③ 三层合并(自身 tier0 + co-vis tier1 + 热门 tier2)→ 去重保留最小 ord
-    #    → 取前 k → 收成列表
-    return (pl.concat([self_c, covis_c, pop_long])
+
+def _soft_rank(self_scored: pl.DataFrame, covis_votes: pl.DataFrame) -> pl.DataFrame:
+    """软融合:两臂各自按 session 归一化 → 加权求和 → 排一次 → [session, aid, ord]。
+    强度可跨臂竞争:高票 co-vis 新品能盖过弱自身候选。"""
+    def norm(df):
+        lo = pl.col("score").min().over("session")
+        hi = pl.col("score").max().over("session")
+        return df.with_columns(n=(pl.col("score") - lo) / (hi - lo + 1e-9))
+
+    s = norm(self_scored).select("session", "aid", pl.col("n").alias("s_self"))
+    c = norm(covis_votes).select("session", "aid", pl.col("n").alias("s_covis"))
+    return (s.join(c, on=["session", "aid"], how="full", coalesce=True)
+             .with_columns(u=W_SELF * pl.col("s_self").fill_null(0)
+                             + W_COVIS * pl.col("s_covis").fill_null(0))
+             .sort(["session", "u"], descending=[False, True])
+             .with_columns(ord=pl.int_range(pl.len()).over("session"))
+             .select("session", "aid", "ord"))
+
+
+def _predict_one_type(seeds: pl.DataFrame, pop_long: pl.DataFrame,
+                      matrices: dict, names: list[str], k: int,
+                      blend: bool) -> pl.DataFrame:
+    """两臂(带分数)按 blend 选硬/软合并 + 热门兜底 → [session, prediction]。"""
+    # 1. 两臂,都带分数
+    self_scored = seeds.select("session", "aid", score=pl.col("seed_wgt"))
+    covis_votes = (pl.concat([_votes(seeds, matrices[n]) for n in names])
+                     .group_by(["session", "aid"]).agg(pl.col("score").sum()))
+
+    # 2. 分叉:只决定 real 怎么排
+    real = (_soft_rank(self_scored, covis_votes) if blend
+            else _hard_rank(self_scored, covis_votes))
+
+    # 3. 共用尾巴:接热门 → 去重(留最小 ord)→ 取 k → 收列表
+    return (pl.concat([real, pop_long])
               .sort(["session", "ord"])
               .unique(subset=["session", "aid"], keep="first", maintain_order=True)
               .with_columns(r=pl.int_range(pl.len()).over("session"))
@@ -88,23 +126,18 @@ def _predict_one_type(seeds: pl.DataFrame, self_c: pl.DataFrame,
 def generate_predictions(val_input: pl.DataFrame, matrices: dict,
                          popular: list[int], k: int = 20,
                          max_seeds: int = 30) -> pl.DataFrame:
-    """分目标分层融合 → 每 session、每 type 各取 top-k。"""
+    """分目标融合(硬/软按 TYPE_BLEND)→ 每 session、每 type 取 top-k。"""
     seeds = get_seeds(val_input, max_seeds)
 
-    # 自身臂(tier0)、热门(tier2):和目标无关,只算一次,三目标复用
-    self_c = (seeds.sort(["session", "seed_wgt"], descending=[False, True])
-                   .with_columns(ord=pl.int_range(pl.len()).over("session"))
-                   .select("session", "aid", "ord"))
-    
+    # 热门(tier2):和目标无关,只算一次
     pop_df = (pl.DataFrame({"aid": pl.Series(popular, dtype=pl.Int32)})
                 .with_row_index("pr")
                 .with_columns(ord=TIER_POP + pl.col("pr").cast(pl.Int64))
                 .select("aid", "ord"))
-     
     pop_long = seeds.select("session").unique().join(pop_df, how="cross")
 
-    # 按目标各跑一遍,只有 co-vis 那一路换矩阵
-    out = [_predict_one_type(seeds, self_c, pop_long, matrices, names, k)
+    # 按目标各跑一遍,只有 co-vis 那一路换矩阵、按 TYPE_BLEND 选硬/软
+    out = [_predict_one_type(seeds, pop_long, matrices, names, k, blend=TYPE_BLEND[t])
              .with_columns(type=pl.lit(t, dtype=pl.Int8))
            for t, names in TYPE_MATRIX.items()]
     return pl.concat(out).select("session", "type", "prediction")
