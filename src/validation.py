@@ -169,7 +169,7 @@ def baseline_recent(val_input: pl.DataFrame) -> pl.DataFrame:
     """把每个 session 输入里最近交互的 K 个 aid(逆序去重)当预测,三种 type 共用。"""
     recent = (
         val_input
-        .sort(["session", "ts"], descending=[False, True])   # 组内最近的排前面
+        .sort(["session", "ts", "aid"], descending=[False, True, False])   # 组内最近的排前面(aid 兜底可复现)
         .group_by("session", maintain_order=True)
         .agg(pl.col("aid").unique(maintain_order=True)       # 去重、保留最近顺序
                  .head(K).alias("prediction"))

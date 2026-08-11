@@ -5,7 +5,7 @@ Phase 2 · 召回 · 编排 + 量分 + 消融
 每加一路跑一次 → 攒消融表。
 
 跑法:
-    python src/recall/run_recall.py --sample   # 10 万 val 切片 + 1/6 训练建矩阵,快速验证
+    python src/recall/run_recall.py --sample   # 随机 10 万 val；复用已有矩阵，缺失时建全量(不再建 1/6)
     python src/recall/run_recall.py            # 全量 val + 全量 co-vis(真实分数)
     python src/recall/run_recall.py --build     # 强制重建 co-vis 矩阵
 """
@@ -47,10 +47,11 @@ if __name__ == "__main__":
     KINDS = ["click", "buy_weighted", "buy2buy"]
 
     for kind in KINDS:
-        # 建 / 载 click co-vis 矩阵(用防泄漏语料;--build 时连语料一起重建)
+        # 建 / 载当前 kind 的 co-vis 矩阵(用防泄漏语料;--build 时连语料一起重建)
         # 检查是否需要建矩阵:若 parquet 文件不存在或 --build,就建
         if rebuild or not (COVIS_DIR / f"{kind}.parquet").exists():
-            build_covis(kind, max_chunks=5 if sample else None, rebuild_corpus=rebuild)
+            # 永远建全量矩阵:--sample 只切 val,不再建 1/6 采样矩阵(防口径混用/覆盖)
+            build_covis(kind, rebuild_corpus=rebuild)
     
     # 把三张构建好的co-vis 矩阵载入
     # output:  {'click': DataFrame, 'buy_weighted': DataFrame, 'buy2buy': DataFrame}

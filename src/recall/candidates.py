@@ -12,7 +12,7 @@ preds[session, type, prediction]。三个目标各用不同的矩阵组合(分�
 
 融合(见 TYPE_BLEND):
   硬分层  —— 自身臂永远压 co-vis(clicks 复访主导,适用)。
-  软融合  —— 两臂分数归一化后加权求和,强 co-vis 新品能盖过弱自身(carts/orders)。
+  软融合  —— 两臂分数归一化后加权求和；已实验证伪，当前三个目标均使用硬分层。
 """
 import polars as pl
 
@@ -47,7 +47,7 @@ def get_seeds(val_input: pl.DataFrame, max_seeds: int = 30) -> pl.DataFrame:
 
     # 在去重后的商品中，只选当前 session 最近的几个商品作为种子。
     # 按 session 排序,最近的种子排前面 → 取前 max_seeds 个
-    g = (g.sort(["session", "last_ts"], descending=[False, True])
+    g = (g.sort(["session", "last_ts", "aid"], descending=[False, True, False])  # aid 兜底可复现
           .with_columns(rank=pl.int_range(pl.len()).over("session"))
           .filter(pl.col("rank") < max_seeds))
 
@@ -73,10 +73,10 @@ def _votes(seeds: pl.DataFrame, covis: pl.DataFrame) -> pl.DataFrame:
 
 def _hard_rank(self_scored: pl.DataFrame, covis_votes: pl.DataFrame) -> pl.DataFrame:
     """硬分层:自身 tier0 + co-vis tier1 → [session, aid, ord]。臂决定优先级。"""
-    self_c = (self_scored.sort(["session", "score"], descending=[False, True])
+    self_c = (self_scored.sort(["session", "score", "aid"], descending=[False, True, False])
                          .with_columns(ord=pl.int_range(pl.len()).over("session"))
                          .select("session", "aid", "ord"))
-    covis_c = (covis_votes.sort(["session", "score"], descending=[False, True])
+    covis_c = (covis_votes.sort(["session", "score", "aid"], descending=[False, True, False])
                           .with_columns(ord=TIER_COVIS + pl.int_range(pl.len()).over("session"))
                           .select("session", "aid", "ord"))
     return pl.concat([self_c, covis_c])
@@ -95,7 +95,7 @@ def _soft_rank(self_scored: pl.DataFrame, covis_votes: pl.DataFrame) -> pl.DataF
     return (s.join(c, on=["session", "aid"], how="full", coalesce=True)
              .with_columns(u=W_SELF * pl.col("s_self").fill_null(0)
                              + W_COVIS * pl.col("s_covis").fill_null(0))
-             .sort(["session", "u"], descending=[False, True])
+             .sort(["session", "u", "aid"], descending=[False, True, False])
              .with_columns(ord=pl.int_range(pl.len()).over("session"))
              .select("session", "aid", "ord"))
 
@@ -115,7 +115,7 @@ def _predict_one_type(seeds: pl.DataFrame, pop_long: pl.DataFrame,
 
     # 3. 共用尾巴:接热门 → 去重(留最小 ord)→ 取 k → 收列表
     return (pl.concat([real, pop_long])
-              .sort(["session", "ord"])
+              .sort(["session", "ord", "aid"])
               .unique(subset=["session", "aid"], keep="first", maintain_order=True)
               .with_columns(r=pl.int_range(pl.len()).over("session"))
               .filter(pl.col("r") < k)

@@ -1,6 +1,6 @@
 """
-Phase 2 · 召回 · co-visitation 矩阵(Step 1 只做 click 这一路)
-===========================================================
+Phase 2 · 召回 · 三张 co-visitation 矩阵
+========================================
 本质:数一遍"谁和谁常在同一 session 里一起出现",再对每个商品只保留最强的
 top-N 邻居。不训练参数,纯统计。
 
@@ -12,8 +12,8 @@ top-N 邻居。不训练参数,纯统计。
   这样任一时刻内存里只有"一块的两两对",不是全量。
 
 跑法:
-    python src/recall/run_recall.py            # 会自动建 click 矩阵
-    # 或单独建:python -c "from src.recall.covis import build_covis; build_covis()"
+    python src/recall/run_recall.py            # 缺哪张就自动建哪张
+    # 或单独建 click:python -c "from src.recall.covis import build_covis; build_covis('click')"
 """
 import shutil
 import time
@@ -31,7 +31,7 @@ DAY_MS = 86_400_000
 VAL_DAYS = 7                                        # 必须与 make_validation_set 的 val_days 一致
 
 # 三张矩阵的差异全在:时间窗口 / 事件过滤 / 邻居数 / 加权(见 _weight_expr)
-# Step 1 只启用 click;buy_weighted 和 buy2buy 留到 Step 2。
+# 当前三种 kind 均已启用；调用 build_covis(kind) 时一次只构建其中一张。
 COVIS_CONFIG = {
     "click": {"window": 60 * 60 * 1000, "types": None, "top_n": 50},   # 1 小时,不过滤
     "buy_weighted": {"window": 60 * 60 * 1000, "types": None,   "top_n": 50}, # 1 小时,不过滤
@@ -200,10 +200,10 @@ def build_covis(kind: str = "click", n_chunks: int = 30,
     COVIS_DIR.mkdir(parents=True, exist_ok=True)
     final = (pl.scan_parquet(tmp / "*.parquet")         # 流式读所有 chunk
                .group_by(["aid", "aid_y"]).agg(pl.col("wgt").sum()) # 跨 chunk 聚合, 根据 aid→aid_y 求和
-               .collect(engine="streaming"))       # 流式聚合,内存不随分块数膨胀
+               .collect(engine="streaming"))       # 流式读取可降峰值；高基数组状态/最终结果仍占内存
     
     # ⑤ 排序 + 截 top_n
-    final = (final.sort(["aid", "wgt"], descending=[False, True])
+    final = (final.sort(["aid", "wgt", "aid_y"], descending=[False, True, False])  # aid_y 兜底键:wgt 打平也确定
                   .with_columns(_r=pl.int_range(pl.len()).over("aid"))
                   .filter(pl.col("_r") < cfg["top_n"])
                   .drop("_r")
