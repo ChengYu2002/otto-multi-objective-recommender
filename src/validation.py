@@ -4,12 +4,16 @@ Phase 1 · 本地验证框架
 目标:在本地复刻 Kaggle LB 的加权 Recall@20,让"改了召回/特征 → 分数变没变"
 可以离线快速验证,不依赖有限的 LB 提交次数。
 
-三个产物:
+核心产物:
   1. make_validation_set() : 从 train 切出本地验证集
        - val_input  : 每个验证 session 截断后的输入事件(喂给模型的那半段)
        - val_labels : 每个验证 session 藏起来的 ground truth(clicks/carts/orders)
   2. baseline_recent()     : 一个"傻 baseline"(推自己最近看过的商品),用来自测框架
-  3. evaluate(preds, labels) -> dict : 加权 Recall@20
+  3. evaluate(preds, labels) -> dict : 加权 Recall@20(LB 口径的正式分)
+诊断产物(Phase 2 收尾加):
+  4. evaluate_at_ks(preds, labels, ks) : 多个 K 的加权 Recall@K
+       —— @50/@100 是 Phase 3 精排的"候选天花板"(GBDT 只能在候选集里重排)
+  5. popular_share(preds, popular, k)  : top-k 里热门占比(对热门兜底的依赖度上界)
 
 指标定义(必须和 LB 完全一致,micro 求和,不是逐 session 求平均!):
   对每个 type t ∈ {clicks, carts, orders}:
@@ -199,6 +203,7 @@ def evaluate(preds: pl.DataFrame, labels: pl.DataFrame) -> dict:
     P = preds.with_columns(pl.col("prediction").cast(pl.List(pl.Int64)))
 
     df = (
+        # 以左边的 L 为准，L 里的每一行都必须保留；然后去 P 里找相同 session + type 的预测。找不到就填 null
         L.join(P, on=["session", "type"], how="left")
          # 某 session/type 没给预测 -> 当空列表处理(命中 0)
          .with_columns(
@@ -229,6 +234,7 @@ def evaluate(preds: pl.DataFrame, labels: pl.DataFrame) -> dict:
     return res
 
 
+# 结构上和 evaluate() 一样,只是多了一个参数 ks,可以一次算多个 K 的 recall。
 def evaluate_at_ks(preds: pl.DataFrame, labels: pl.DataFrame,
                    ks=(20, 50, 100)) -> dict:
     """多个 K 的加权 Recall@K → {K: {clicks, carts, orders, weighted}}。

@@ -31,9 +31,9 @@ def _fmt(name: str, s: dict) -> None:
 if __name__ == "__main__":
     sample = "--sample" in sys.argv
     rebuild = "--build" in sys.argv
-    # 输入
+    # 输入 导入
     val_input = pl.read_parquet(VAL_DIR / "input.parquet")
-    # 正确答案
+    # 正确答案 导入
     val_labels = pl.read_parquet(VAL_DIR / "labels.parquet")
 
     if sample:
@@ -42,6 +42,7 @@ if __name__ == "__main__":
         # 才和全量同分布(baseline ~0.41),小旋钮实验的相对排序才可信。
         keep = val_input.select("session").unique().sort("session").sample(100_000, seed=42)
         val_input = val_input.join(keep, on="session", how="semi")
+        # 只保留 session 存在于 keep 名单中的 val_input （左表）事件。
         val_labels = val_labels.join(keep, on="session", how="semi")
 
     KINDS = ["click", "buy_weighted", "buy2buy"]
@@ -70,10 +71,14 @@ if __name__ == "__main__":
     base = evaluate(baseline_recent(val_input), val_labels)
     print(f"  recent baseline      weighted@20 {base['weighted']:.4f}")
     res = evaluate_at_ks(preds, val_labels, ks=eval_ks)
+
+    # recall@20/50/100 分别evaluate
     for kk in eval_ks:
         s = res[kk]
         print(f"  multi-covis @{kk:<3}    clicks {s['clicks']:.4f} | carts {s['carts']:.4f} | "
               f"orders {s['orders']:.4f} | weighted {s['weighted']:.4f}")
+    
+    # 热门占比(top20,上界) clicks/carts/orders
     if sample:
         sh = popular_share(preds, popular, k=20)
         print(f"  热门占比(top20,上界) clicks {sh.get('clicks', 0):.1%} | "

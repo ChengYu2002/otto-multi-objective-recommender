@@ -108,15 +108,17 @@ def build_covis(kind: str = "click", n_chunks: int = 30,
 
     n_chunks       : 按 session 分成多少块(越多越省内存、越慢)
     max_chunks     : 只处理前几块(采样,快速验证用);None = 全部
-    session_cap    : 每个 session 只保留最近多少个事件
+    session_cap    : 每个 session 最多保留最近多少个事件
     rebuild_corpus : 强制重建防泄漏语料(改了 val 切分后需要)
     """
     cfg = COVIS_CONFIG[kind]
     t0 = time.time()
     build_corpus(force=rebuild_corpus)              # ← 用防泄漏语料,不是原始 train
     lf = pl.scan_parquet(CORPUS_PARQUET)
+
     if cfg["types"] is not None:                    # buy2buy 只看加购/下单
         lf = lf.filter(pl.col("type").is_in(cfg["types"]))
+
     tmin, tmax = lf.select(pl.col("ts").min().alias("mn"),
                            pl.col("ts").max().alias("mx")).collect().row(0)
 
@@ -202,7 +204,7 @@ def build_covis(kind: str = "click", n_chunks: int = 30,
                .group_by(["aid", "aid_y"]).agg(pl.col("wgt").sum()) # 跨 chunk 聚合, 根据 aid→aid_y 求和
                .collect(engine="streaming"))       # 流式读取可降峰值；高基数组状态/最终结果仍占内存
     
-    # ⑤ 排序 + 截 top_n
+    # ⑤ 排序 + 截 top_n / wgt 相同 → aid_y 小的优先
     final = (final.sort(["aid", "wgt", "aid_y"], descending=[False, True, False])  # aid_y 兜底键:wgt 打平也确定
                   .with_columns(_r=pl.int_range(pl.len()).over("aid"))
                   .filter(pl.col("_r") < cfg["top_n"])

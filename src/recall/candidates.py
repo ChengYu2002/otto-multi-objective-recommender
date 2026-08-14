@@ -41,6 +41,7 @@ def get_seeds(val_input: pl.DataFrame, max_seeds: int = 30) -> pl.DataFrame:
     """每个 session 的最近去重商品 + 权重(近期衰减 × 最近一次的类型权重)。"""
     # 同一个商品重复出现时，只保留它最近一次的信息
     # 按 session+aid 聚合,取最近一次 ts 和 type → 按 session+ts 排序 → 取前 max_seeds
+    # 每个 session 内给行编号， rank=0,1,2,...
     g = (val_input.group_by(["session", "aid"])
          .agg(last_ts=pl.col("ts").max(),
               last_type=pl.col("type").sort_by("ts").last()))
@@ -51,8 +52,10 @@ def get_seeds(val_input: pl.DataFrame, max_seeds: int = 30) -> pl.DataFrame:
           .with_columns(rank=pl.int_range(pl.len()).over("session"))
           .filter(pl.col("rank") < max_seeds))
 
-    # 计算种子权重 = 近期衰减 × 类型权重
+    # 计算类型权重:加购/下单比点击值钱(Chris Deotte 常用 1/6/3)
     type_w = pl.col("last_type").replace_strict(TYPE_W, return_dtype=pl.Float64)
+
+    # 计算种子权重 = 近期衰减 × 类型权重
     # 近期衰减:最新种子权重 1,往前每位 ×0.9
     g = g.with_columns(seed_wgt=pl.lit(DECAY).pow(pl.col("rank")) * type_w)
 
@@ -65,6 +68,7 @@ def _votes(seeds: pl.DataFrame, covis: pl.DataFrame) -> pl.DataFrame:
     关键:这里只出"原始 score"。多张矩阵要在 _predict_one_type 里先把 score
     相加,才能体现"被多路共同看好"。若在这就排序加 ord,多矩阵就没法相加了。
     """
+    
     return (seeds.join(covis, left_on="aid", right_on="aid_x")
                  .with_columns(score=pl.col("seed_wgt") * pl.col("wgt"))
                  .group_by(["session", "aid_y"]).agg(pl.col("score").sum())
@@ -85,11 +89,13 @@ def _hard_rank(self_scored: pl.DataFrame, covis_votes: pl.DataFrame) -> pl.DataF
 def _soft_rank(self_scored: pl.DataFrame, covis_votes: pl.DataFrame) -> pl.DataFrame:
     """软融合:两臂各自按 session 归一化 → 加权求和 → 排一次 → [session, aid, ord]。
     强度可跨臂竞争:高票 co-vis 新品能盖过弱自身候选。"""
+    # 归一化:每个 session 内,score 归一化到 [0, 1]。避免不同 session 的 score 范围差异过大。
     def norm(df):
         lo = pl.col("score").min().over("session")
         hi = pl.col("score").max().over("session")
         return df.with_columns(n=(pl.col("score") - lo) / (hi - lo + 1e-9))
-
+    
+    # 两臂各自归一化,再按 session+aid join,缺失的填 0 → 计算总分 u → 排序 → 编 ord
     s = norm(self_scored).select("session", "aid", pl.col("n").alias("s_self"))
     c = norm(covis_votes).select("session", "aid", pl.col("n").alias("s_covis"))
     return (s.join(c, on=["session", "aid"], how="full", coalesce=True)
@@ -114,6 +120,9 @@ def _predict_one_type(seeds: pl.DataFrame, pop_long: pl.DataFrame,
             else _hard_rank(self_scored, covis_votes))
 
     # 3. 共用尾巴:接热门 → 去重(留最小 ord)→ 取 k → 收列表
+    # 某商品既是历史商品又被 co-vis 召回：保留历史版本；
+    # 某商品既被 co-vis 召回又在热门榜：保留 co-vis 版本；
+    #  热门榜只补还没有出现的商品。
     return (pl.concat([real, pop_long])
               .sort(["session", "ord", "aid"])
               .unique(subset=["session", "aid"], keep="first", maintain_order=True)
