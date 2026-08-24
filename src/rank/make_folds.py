@@ -24,6 +24,13 @@ Phase 3 · 精排 · Step -1:造两个时间折(rank-train / rank-valid)
 
 纪律:同 session 不跨折(anti-join 全部 val session)· rank_valid == 现有 val
      · sort→sample 固定 seed 可复现 · cut 排序带 aid 兜底键。
+
+已知口径限制(为保持 Phase 2 可比,当前接受):
+    现有 val 是“按事件时间取最后一周”,不是 OTTO 官方的“按 session 首次事件归属”。
+    原始数据中有 1,514,189 个 session 在倒数第二周和最后一周均有事件
+    (约占未排除 rank-train session 的 32.6%)。当前代码将这些 session 保留在 rank-valid,
+    并从 rank-train query 中整体排除;其更早事件仍可作为 valid 时刻已发生的历史语料。
+    这是当前本地 CV 的实用口径,不是“所有序列推荐都必须 user/session 不重叠”的通用定律。
 本文件只造折,不碰 co-vis / 特征 / 模型。
 
 跑法:
